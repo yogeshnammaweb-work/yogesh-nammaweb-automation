@@ -19,6 +19,13 @@ CHROMA_PATH = Path("data/chroma_db")
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 OLLAMA_MODEL = "llama3.2:3b"
 
+# Smaller chunks = more, narrower pieces of text. Each chunk stays
+# focused on one fact/topic instead of blending several together,
+# which makes its embedding match short queries more precisely and
+# gives the LLM cleaner, more relevant context to read from.
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 100
+
 DOCUMENTS_PATH.mkdir(parents=True, exist_ok=True)
 CHROMA_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -56,7 +63,6 @@ def _html_safe_markdown(body, *args, **kwargs):
 
 
 st.markdown = _html_safe_markdown
-
 
 
 # ============================================================
@@ -581,8 +587,8 @@ def load_rag(pdf_path, rag_version):
     pages = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
 
     chunks = splitter.split_documents(pages)
@@ -603,6 +609,51 @@ def load_rag(pdf_path, rag_version):
     )
 
     return vector_store, llm, pages, chunks
+
+
+# ============================================================
+# RETRIEVAL HELPER
+# ------------------------------------------------------------
+# Plain top-k similarity search often misses document-level
+# facts (college name, author/student names, title) because
+# they usually sit on the cover page, which may not be the
+# most *semantically* similar chunk to a short query like
+# "which college does it belong to". Two changes fix this:
+#
+# 1. Use max_marginal_relevance_search (MMR) instead of plain
+#    similarity_search — it pulls a more diverse set of chunks
+#    from a larger candidate pool (fetch_k) instead of 4
+#    near-duplicate ones, and we raise k so more of the
+#    document is actually considered.
+# 2. Always splice in the first page's content — cover-page
+#    facts are almost always there, and this guarantees the
+#    LLM sees them regardless of embedding similarity.
+# ============================================================
+
+def retrieve_context(vector_store, pages, query, k=6, fetch_k=20):
+    docs = vector_store.max_marginal_relevance_search(
+        query,
+        k=k,
+        fetch_k=fetch_k,
+    )
+
+    if pages:
+        first_page = pages[0]
+        already_included = any(
+            d.page_content == first_page.page_content for d in docs
+        )
+        if not already_included:
+            docs = [first_page] + docs
+
+    context = "\n\n".join(
+        [
+            f"Page {doc.metadata.get('page', 0) + 1}:\n"
+            f"{doc.page_content}"
+            for doc in docs
+        ]
+    )
+
+    return context
 
 
 # ============================================================
@@ -1021,17 +1072,12 @@ with main_col:
                 "Searching the knowledge base..."
             ):
 
-                docs = vector_store.similarity_search(
+                context = retrieve_context(
+                    vector_store,
+                    pages,
                     query,
-                    k=4,
-                )
-
-                context = "\n\n".join(
-                    [
-                        f"Page {doc.metadata.get('page', 0) + 1}:\n"
-                        f"{doc.page_content}"
-                        for doc in docs
-                    ]
+                    k=8,
+                    fetch_k=30,
                 )
 
                 prompt = f"""
